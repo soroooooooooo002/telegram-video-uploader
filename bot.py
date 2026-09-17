@@ -56,7 +56,7 @@ def keep_alive():
                 print(f"[Keep-Alive] Ping failed: {e}")
 
 def download_file_in_chunks(url, target_path):
-    """Downloads video files in chunks to avoid high memory usage."""
+    """Downloads video files in chunks to avoid high memory usage on Koyeb/Render."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
@@ -69,7 +69,7 @@ def download_file_in_chunks(url, target_path):
                     f.write(chunk)
 
 def parse_blocks(file_path):
-    """Parses text file formatted with delimiter lines."""
+    """Parses text file formatted with line delimiters or block sections."""
     if not os.path.exists(file_path):
         print(f"Error: Data file '{file_path}' not found!")
         return []
@@ -141,7 +141,7 @@ async def main():
         except Exception as e:
             print(f"Error processing item {index} ({title}): {e}")
         finally:
-            # Clean up temporary video file from disk
+            # Clean up temporary video file from disk immediately
             if os.path.exists(TEMP_FILE):
                 os.remove(TEMP_FILE)
 
@@ -153,15 +153,16 @@ async def main():
 # 5. ENTRY POINT
 # ==========================================
 if __name__ == "__main__":
-    # Safety Check: Prevent startup if SESSION_STRING is missing
     if not SESSION_STRING:
         print("CRITICAL ERROR: 'SESSION_STRING' environment variable is missing or empty!")
         print("Generate a session string locally and add it to Render Environment Variables.")
         exit(1)
 
-    # Start Flask Web Server Thread
-    threading.Thread(target=run_web_server, daemon=True).start()
+    # 1. Start Flask web server on a background daemon thread
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    print("Flask health check server started on background thread.")
 
-    # Run Telethon Event Loop
+    # 2. Start Telethon loop on the main thread
     with client:
         client.loop.run_until_complete(main())
