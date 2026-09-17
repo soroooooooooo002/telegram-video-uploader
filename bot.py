@@ -122,10 +122,23 @@ def parse_blocks(file_path):
 # ==========================================
 async def main():
     print("Connecting to Telegram via StringSession...", flush=True)
-    await client.start()
-    print("Successfully connected to Telegram!", flush=True)
 
-    # Start self-ping thread for Render
+    try:
+        # Prevents interactive login prompts that trigger EOFError on cloud hosts
+        await client.start(phone=lambda: None)
+        print("Successfully connected to Telegram!", flush=True)
+    except Exception as e:
+        print(
+            f"CRITICAL AUTH ERROR: Could not authenticate SESSION_STRING. Details: {e}",
+            flush=True,
+        )
+        print(
+            "Please generate a fresh SESSION_STRING on your local machine and update your Environment Variables.",
+            flush=True,
+        )
+        return
+
+    # Start self-ping thread for web service keep-alive
     threading.Thread(target=keep_alive, daemon=True).start()
 
     # Load items from data.txt
@@ -137,7 +150,7 @@ async def main():
         title = item.get("title", "Untitled Video")
         page_url = item.get("page_url", "")
         file_url = item.get("file_url", "")
-        thumb_url = item.get("thumb_url", "")
+        thumb_url = item.get("thumbnail", item.get("thumb_url", ""))
 
         # Format Telegram caption with Markdown
         caption = f"**{title}**"
@@ -165,7 +178,7 @@ async def main():
                     height = clip.h
             except Exception as e:
                 print(
-                    f"Failed to extract video duration metadata: {e}",
+                    f"Failed to extract video metadata: {e}",
                     flush=True,
                 )
 
@@ -220,7 +233,7 @@ async def main():
         except Exception as e:
             print(f"Error processing item {index} ({title}): {e}", flush=True)
         finally:
-            # Clean up all local temporary files
+            # Clean up local temporary files immediately
             for temp in [TEMP_FILE, TEMP_WEBP, TEMP_JPG]:
                 if os.path.exists(temp):
                     os.remove(temp)
@@ -240,7 +253,7 @@ if __name__ == "__main__":
         )
         exit(1)
 
-    # Start Flask Web Server
+    # Start Flask Web Server in background
     threading.Thread(target=run_web_server, daemon=True).start()
 
     # Run Telethon Event Loop
