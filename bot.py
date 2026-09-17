@@ -4,13 +4,18 @@ import threading
 import time
 import urllib.parse
 from flask import Flask
-from moviepy.editor import VideoFileClip
 from PIL import Image
 import requests
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
+
+# Safe MoviePy import supporting both v1.x and v2.x
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    from moviepy.video.io.VideoFileClip import VideoFileClip
 
 # ==========================================
 # 1. FLASK WEB SERVER (For Render Health Checks)
