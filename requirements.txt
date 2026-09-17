@@ -1,3 +1,5 @@
 telethon
-requests
 flask
+requests
+Pillow
+moviepy
