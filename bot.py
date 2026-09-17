@@ -42,7 +42,6 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
-# Convert Channel ID to integer if it is numeric (e.g., -1001234567890)
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
     CHANNEL_ID = int(CHANNEL_ID)
 
@@ -50,7 +49,6 @@ TEMP_FILE = "temp_video.mp4"
 TEMP_WEBP = "temp_thumb.webp"
 TEMP_JPG = "temp_thumb.jpg"
 
-# Initialize Telethon Client with StringSession
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 
@@ -60,7 +58,7 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 def keep_alive():
     """Pings the Render web service periodically to prevent idling."""
     while True:
-        time.sleep(600)  # Ping every 10 minutes
+        time.sleep(600)
         if RENDER_EXTERNAL_URL:
             try:
                 requests.get(RENDER_EXTERNAL_URL, timeout=10)
@@ -69,7 +67,7 @@ def keep_alive():
 
 
 def download_file_in_chunks(url, target_path):
-    """Downloads video files and thumbnails in chunks to preserve memory."""
+    """Downloads files in chunks to avoid high memory consumption."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -85,7 +83,7 @@ def download_file_in_chunks(url, target_path):
 
 
 def parse_blocks(file_path):
-    """Parses data.txt file formatted with block structures or blank lines."""
+    """Parses text file containing line blocks."""
     if not os.path.exists(file_path):
         print(f"Error: Data file '{file_path}' not found!", flush=True)
         return []
@@ -121,24 +119,25 @@ def parse_blocks(file_path):
 # 4. MAIN WORKFLOW
 # ==========================================
 async def main():
-    print("Connecting to Telegram via StringSession...", flush=True)
+    print("Connecting to Telegram...", flush=True)
 
-    try:
-        # Prevents interactive login prompts that trigger EOFError on cloud hosts
-        await client.start(phone=lambda: None)
-        print("Successfully connected to Telegram!", flush=True)
-    except Exception as e:
+    # Direct connection without interactive fallback
+    await client.connect()
+
+    if not await client.is_user_authorized():
         print(
-            f"CRITICAL AUTH ERROR: Could not authenticate SESSION_STRING. Details: {e}",
+            "CRITICAL AUTH ERROR: SESSION_STRING is invalid or expired!",
             flush=True,
         )
         print(
-            "Please generate a fresh SESSION_STRING on your local machine and update your Environment Variables.",
+            "Please generate a new SESSION_STRING on your local machine and update Render Environment Variables.",
             flush=True,
         )
         return
 
-    # Start self-ping thread for web service keep-alive
+    print("Successfully authorized and connected to Telegram!", flush=True)
+
+    # Start self-ping thread
     threading.Thread(target=keep_alive, daemon=True).start()
 
     # Load items from data.txt
@@ -152,7 +151,6 @@ async def main():
         file_url = item.get("file_url", "")
         thumb_url = item.get("thumbnail", item.get("thumb_url", ""))
 
-        # Format Telegram caption with Markdown
         caption = f"**{title}**"
         if page_url:
             caption += f"\n\n🔗 [Watch Original Page]({page_url})"
@@ -163,14 +161,13 @@ async def main():
         height = 0
 
         try:
-            # 1. Download Video File
             print(
                 f"[{index}/{total_items}] Downloading Video: {title}...",
                 flush=True,
             )
             download_file_in_chunks(file_url, TEMP_FILE)
 
-            # 2. Extract Duration and Dimensions for Video Player
+            # Extract video attributes
             try:
                 with VideoFileClip(TEMP_FILE) as clip:
                     duration = int(clip.duration)
@@ -182,7 +179,7 @@ async def main():
                     flush=True,
                 )
 
-            # 3. Download and Convert Thumbnail (.webp -> .jpg)
+            # Download and convert thumbnail
             if thumb_url:
                 try:
                     print(
@@ -202,7 +199,6 @@ async def main():
                         flush=True,
                     )
 
-            # 4. Upload Video with Duration and Cover Art
             print(
                 f"[{index}/{total_items}] Uploading to Telegram...", flush=True
             )
@@ -233,12 +229,10 @@ async def main():
         except Exception as e:
             print(f"Error processing item {index} ({title}): {e}", flush=True)
         finally:
-            # Clean up local temporary files immediately
             for temp in [TEMP_FILE, TEMP_WEBP, TEMP_JPG]:
                 if os.path.exists(temp):
                     os.remove(temp)
 
-        # Rate-limiting delay between uploads
         await asyncio.sleep(5)
 
 
@@ -253,9 +247,9 @@ if __name__ == "__main__":
         )
         exit(1)
 
-    # Start Flask Web Server in background
+    # Start Flask Web Server
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    # Run Telethon Event Loop
-    with client:
-        client.loop.run_until_complete(main())
+    # Run Telethon event loop directly without using 'with client:'
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
