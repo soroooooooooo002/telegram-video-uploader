@@ -2,4 +2,5 @@ telethon
 flask
 requests
 Pillow
-hachoir
+moviepy==1.0.3
+decorator<5.0.0
