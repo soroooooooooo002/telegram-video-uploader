@@ -250,6 +250,5 @@ if __name__ == "__main__":
     # Start Flask Web Server
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    # Run Telethon event loop directly without using 'with client:'
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    # Python 3.14+ compatible entry point
+    asyncio.run(main())
