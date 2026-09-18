@@ -3,15 +3,21 @@ import os
 import threading
 import time
 import urllib.parse
+
 from flask import Flask
 from PIL import Image
 import requests
+
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
 
-# Safe MoviePy import supporting both v1.x and v2.x
+
+# ==========================================
+# SAFE MOVIEPY IMPORT
+# ==========================================
+
 try:
     from moviepy.editor import VideoFileClip
 except ImportError:
@@ -32,30 +38,66 @@ def health_check():
 
 def run_web_server():
     port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
 
 
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+API_ID = int(
+    os.getenv("API_ID", "0")
+)
+
+API_HASH = os.getenv(
+    "API_HASH",
+    ""
+)
+
+SESSION_STRING = os.getenv(
+    "SESSION_STRING",
+    ""
+)
+
+CHANNEL_ID = os.getenv(
+    "CHANNEL_ID",
+    ""
+)
+
+RENDER_EXTERNAL_URL = os.getenv(
+    "RENDER_EXTERNAL_URL",
+    ""
+)
+
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
     CHANNEL_ID = int(CHANNEL_ID)
 
 
+# ==========================================
+# TEMP FILES
+# ==========================================
+
 TEMP_FILE = "temp_video.mp4"
 TEMP_WEBP = "temp_thumb.webp"
 TEMP_JPG = "temp_thumb.jpg"
 
+
+# ==========================================
+# PROGRESS FILES
+# ==========================================
+
 COMPLETED_FILE = "completed.txt"
 FAILED_FILE = "failed.txt"
 
+
+# ==========================================
+# TELEGRAM CLIENT
+# ==========================================
 
 client = TelegramClient(
     StringSession(SESSION_STRING),
@@ -65,7 +107,7 @@ client = TelegramClient(
 
 
 # ==========================================
-# 3. HELPER FUNCTIONS
+# 3. KEEP ALIVE
 # ==========================================
 
 def keep_alive():
@@ -92,39 +134,247 @@ def keep_alive():
                 )
 
 
+# ==========================================
+# 4. DOWNLOAD FILE
+# ==========================================
+
 def download_file_in_chunks(url, target_path):
-    """Downloads files in chunks."""
+    """
+    Downloads a file in chunks.
+
+    Includes:
+    - HTTP status checking
+    - Separate connection/read timeout
+    - Download progress
+    - File size reporting
+    - Better error messages
+    """
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 "
+            "Safari/537.36"
         )
     }
 
+
+    # Keep URL characters safe.
     safe_url = urllib.parse.quote(
         url,
         safe=":/%?=&-"
     )
 
-    with requests.get(
-        safe_url,
-        stream=True,
-        headers=headers,
-        timeout=60
-    ) as r:
 
-        r.raise_for_status()
+    # ------------------------------------------
+    # Separate timeouts
+    # ------------------------------------------
 
-        with open(target_path, "wb") as f:
+    # 20 seconds to establish connection.
+    # 60 seconds maximum waiting for data.
+    timeout = (
+        20,
+        60
+    )
 
-            for chunk in r.iter_content(
-                chunk_size=8192
-            ):
 
-                if chunk:
+    try:
+
+        print(
+            "[Download] Connecting to server...",
+            flush=True
+        )
+
+
+        with requests.get(
+            safe_url,
+            stream=True,
+            headers=headers,
+            timeout=timeout
+        ) as r:
+
+            # ----------------------------------
+            # HTTP STATUS
+            # ----------------------------------
+
+            r.raise_for_status()
+
+
+            print(
+                f"[Download] HTTP {r.status_code}",
+                flush=True
+            )
+
+
+            # ----------------------------------
+            # TOTAL FILE SIZE
+            # ----------------------------------
+
+            total_size = int(
+                r.headers.get(
+                    "content-length",
+                    0
+                )
+            )
+
+
+            downloaded = 0
+
+
+            if total_size:
+
+                print(
+                    f"[Download] Size: "
+                    f"{total_size / (1024 * 1024):.2f} MB",
+                    flush=True
+                )
+
+            else:
+
+                print(
+                    "[Download] Size: unknown",
+                    flush=True
+                )
+
+
+            # ----------------------------------
+            # OPEN TEMP FILE
+            # ----------------------------------
+
+            with open(
+                target_path,
+                "wb"
+            ) as f:
+
+                last_report = time.time()
+
+
+                # ----------------------------------
+                # DOWNLOAD LOOP
+                # ----------------------------------
+
+                for chunk in r.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+
+                    if not chunk:
+                        continue
+
+
                     f.write(chunk)
 
+
+                    downloaded += len(chunk)
+
+
+                    # ----------------------------------
+                    # PRINT PROGRESS EVERY 5 SECONDS
+                    # ----------------------------------
+
+                    now = time.time()
+
+
+                    if (
+                        now - last_report
+                        >= 5
+                    ):
+
+                        downloaded_mb = (
+                            downloaded
+                            / (1024 * 1024)
+                        )
+
+
+                        if total_size:
+
+                            total_mb = (
+                                total_size
+                                / (1024 * 1024)
+                            )
+
+
+                            percent = (
+                                downloaded
+                                / total_size
+                            ) * 100
+
+
+                            print(
+                                f"[Download] "
+                                f"{downloaded_mb:.2f} MB / "
+                                f"{total_mb:.2f} MB "
+                                f"({percent:.1f}%)",
+                                flush=True
+                            )
+
+                        else:
+
+                            print(
+                                f"[Download] "
+                                f"{downloaded_mb:.2f} MB downloaded",
+                                flush=True
+                            )
+
+
+                        last_report = now
+
+
+            # ----------------------------------
+            # DOWNLOAD COMPLETE
+            # ----------------------------------
+
+            print(
+                f"[Download] Completed: "
+                f"{downloaded / (1024 * 1024):.2f} MB",
+                flush=True
+            )
+
+
+    # ==========================================
+    # TIMEOUT ERROR
+    # ==========================================
+
+    except requests.exceptions.Timeout as e:
+
+        raise RuntimeError(
+            f"Download timeout: {e}"
+        )
+
+
+    # ==========================================
+    # HTTP ERROR
+    # ==========================================
+
+    except requests.exceptions.HTTPError as e:
+
+        status_code = getattr(
+            e.response,
+            "status_code",
+            "unknown"
+        )
+
+        raise RuntimeError(
+            f"HTTP error {status_code}: {e}"
+        )
+
+
+    # ==========================================
+    # REQUEST ERROR
+    # ==========================================
+
+    except requests.exceptions.RequestException as e:
+
+        raise RuntimeError(
+            f"Download request failed: {e}"
+        )
+
+
+# ==========================================
+# 5. PARSE DATA.TXT
+# ==========================================
 
 def parse_blocks(file_path):
     """Parses data.txt blocks."""
@@ -137,6 +387,7 @@ def parse_blocks(file_path):
         )
 
         return []
+
 
     with open(
         file_path,
@@ -152,11 +403,17 @@ def parse_blocks(file_path):
     )
 
 
-    raw_blocks = (
-        content.split(delimiter)
-        if delimiter in content
-        else content.split("\n\n")
-    )
+    if delimiter in content:
+
+        raw_blocks = content.split(
+            delimiter
+        )
+
+    else:
+
+        raw_blocks = content.split(
+            "\n\n"
+        )
 
 
     parsed_items = []
@@ -166,10 +423,13 @@ def parse_blocks(file_path):
 
         block = block.strip()
 
+
         if not block:
             continue
 
+
         data = {}
+
 
         for line in block.splitlines():
 
@@ -180,7 +440,9 @@ def parse_blocks(file_path):
                     1
                 )
 
-                data[key.strip()] = val.strip()
+                data[
+                    key.strip()
+                ] = val.strip()
 
 
         if (
@@ -188,22 +450,29 @@ def parse_blocks(file_path):
             and data["file_url"]
         ):
 
-            parsed_items.append(data)
+            parsed_items.append(
+                data
+            )
 
 
     return parsed_items
 
 
 # ==========================================
-# COMPLETED / FAILED FILE HELPERS
+# 6. LOAD COMPLETED
 # ==========================================
 
 def load_completed():
 
     completed = set()
 
-    if not os.path.exists(COMPLETED_FILE):
+
+    if not os.path.exists(
+        COMPLETED_FILE
+    ):
+
         return completed
+
 
     try:
 
@@ -217,18 +486,29 @@ def load_completed():
 
                 title = line.strip()
 
+
                 if title:
-                    completed.add(title)
+
+                    completed.add(
+                        title
+                    )
+
 
     except Exception as e:
 
         print(
-            f"[Completed] Could not read file: {e}",
+            f"[Completed] "
+            f"Could not read file: {e}",
             flush=True
         )
 
+
     return completed
 
+
+# ==========================================
+# 7. SAVE COMPLETED
+# ==========================================
 
 def save_completed(title):
 
@@ -240,17 +520,31 @@ def save_completed(title):
             encoding="utf-8"
         ) as f:
 
-            f.write(title.strip() + "\n")
+            f.write(
+                title.strip()
+                + "\n"
+            )
+
 
     except Exception as e:
 
         print(
-            f"[Completed] Could not save: {e}",
+            f"[Completed] "
+            f"Could not save: {e}",
             flush=True
         )
 
 
-def save_failed(index, title, url, error):
+# ==========================================
+# 8. SAVE FAILED
+# ==========================================
+
+def save_failed(
+    index,
+    title,
+    url,
+    error
+):
 
     try:
 
@@ -268,16 +562,18 @@ def save_failed(index, title, url, error):
                 f"{'=' * 80}\n"
             )
 
+
     except Exception as e:
 
         print(
-            f"[Failed] Could not save failed item: {e}",
+            f"[Failed] "
+            f"Could not save failed item: {e}",
             flush=True
         )
 
 
 # ==========================================
-# CHECK EXISTING CHANNEL
+# 9. CHECK EXISTING TELEGRAM CHANNEL
 # ==========================================
 
 async def get_existing_channel_titles():
@@ -287,9 +583,12 @@ async def get_existing_channel_titles():
         flush=True
     )
 
+
     existing_titles = set()
 
+
     scanned = 0
+
 
     try:
 
@@ -300,9 +599,15 @@ async def get_existing_channel_titles():
 
             scanned += 1
 
+
+            # ----------------------------------
+            # READ MESSAGE CAPTION
+            # ----------------------------------
+
             if message.message:
 
                 text = message.message.strip()
+
 
                 if text:
 
@@ -310,7 +615,11 @@ async def get_existing_channel_titles():
                         text.splitlines()[0].strip()
                     )
 
-                    # Remove Markdown bold.
+
+                    # ----------------------------------
+                    # REMOVE MARKDOWN BOLD
+                    # ----------------------------------
+
                     if (
                         first_line.startswith("**")
                         and first_line.endswith("**")
@@ -320,12 +629,17 @@ async def get_existing_channel_titles():
                             2:-2
                         ].strip()
 
+
                     if first_line:
 
                         existing_titles.add(
                             first_line
                         )
 
+
+            # ----------------------------------
+            # PROGRESS
+            # ----------------------------------
 
             if scanned % 10000 == 0:
 
@@ -335,6 +649,10 @@ async def get_existing_channel_titles():
                 )
 
 
+    # ==========================================
+    # FLOOD WAIT
+    # ==========================================
+
     except FloodWaitError as e:
 
         print(
@@ -343,12 +661,18 @@ async def get_existing_channel_titles():
             flush=True
         )
 
+
         await asyncio.sleep(
             e.seconds + 5
         )
 
+
         return await get_existing_channel_titles()
 
+
+    # ==========================================
+    # OTHER ERROR
+    # ==========================================
 
     except Exception as e:
 
@@ -357,8 +681,13 @@ async def get_existing_channel_titles():
             flush=True
         )
 
+
         return existing_titles
 
+
+    # ==========================================
+    # RESULT
+    # ==========================================
 
     print(
         f"Resume check completed. "
@@ -366,16 +695,18 @@ async def get_existing_channel_titles():
         flush=True
     )
 
+
     print(
         f"Found {len(existing_titles)} existing titles.",
         flush=True
     )
 
+
     return existing_titles
 
 
 # ==========================================
-# 4. MAIN WORKFLOW
+# 10. MAIN
 # ==========================================
 
 async def main():
@@ -385,6 +716,10 @@ async def main():
         flush=True
     )
 
+
+    # ==========================================
+    # CONNECT TELEGRAM
+    # ==========================================
 
     await client.connect()
 
@@ -397,11 +732,13 @@ async def main():
             flush=True
         )
 
+
         print(
             "Please generate a new SESSION_STRING "
             "and update Render Environment Variables.",
             flush=True
         )
+
 
         return
 
@@ -413,7 +750,10 @@ async def main():
     )
 
 
-    # Start keep-alive
+    # ==========================================
+    # START KEEP ALIVE
+    # ==========================================
+
     threading.Thread(
         target=keep_alive,
         daemon=True
@@ -428,7 +768,10 @@ async def main():
         "data.txt"
     )
 
-    total_items = len(items)
+
+    total_items = len(
+        items
+    )
 
 
     print(
@@ -443,6 +786,7 @@ async def main():
             "No items found in data.txt.",
             flush=True
         )
+
 
         return
 
@@ -472,7 +816,10 @@ async def main():
     )
 
 
-    # Combine both sources.
+    # ==========================================
+    # COMBINE COMPLETED SOURCES
+    # ==========================================
+
     already_done = (
         existing_titles |
         completed_titles
@@ -483,7 +830,9 @@ async def main():
     # FIND FIRST MISSING ITEM
     # ==========================================
 
-    start_index = total_items + 1
+    start_index = (
+        total_items + 1
+    )
 
 
     for index, item in enumerate(
@@ -515,23 +864,31 @@ async def main():
             flush=True
         )
 
+
         print(
             "ALL ITEMS ARE ALREADY COMPLETED.",
             flush=True
         )
+
 
         print(
             "Nothing new to upload.",
             flush=True
         )
 
+
         print(
             "==========================================",
             flush=True
         )
 
+
         return
 
+
+    # ==========================================
+    # RESUME POSITION
+    # ==========================================
 
     print(
         f"First missing item found: "
@@ -549,7 +906,7 @@ async def main():
 
 
     # ==========================================
-    # UPLOAD LOOP
+    # 11. UPLOAD LOOP
     # ==========================================
 
     for index, item in enumerate(
@@ -557,18 +914,28 @@ async def main():
         1
     ):
 
+        # --------------------------------------
+        # GET TITLE
+        # --------------------------------------
 
-        # Skip items already completed.
         title = item.get(
             "title",
             "Untitled Video"
         ).strip()
 
 
+        # --------------------------------------
+        # SKIP ALREADY COMPLETED
+        # --------------------------------------
+
         if title in already_done:
 
             continue
 
+
+        # --------------------------------------
+        # GET URLS
+        # --------------------------------------
 
         file_url = item.get(
             "file_url",
@@ -586,7 +953,7 @@ async def main():
 
 
         # ==========================================
-        # NEW CAPTION
+        # CAPTION
         # ==========================================
 
         caption = (
@@ -595,6 +962,10 @@ async def main():
             f"(https://t.me/+T_s1eAvQfykzNmM1)"
         )
 
+
+        # ==========================================
+        # DEFAULT VIDEO DATA
+        # ==========================================
 
         thumb_path = None
 
@@ -628,6 +999,13 @@ async def main():
 
             try:
 
+                print(
+                    f"[{index}/{total_items}] "
+                    f"Reading video metadata...",
+                    flush=True
+                )
+
+
                 with VideoFileClip(
                     TEMP_FILE
                 ) as clip:
@@ -641,10 +1019,20 @@ async def main():
                     height = clip.h
 
 
+                print(
+                    f"[{index}/{total_items}] "
+                    f"Video metadata: "
+                    f"{width}x{height}, "
+                    f"{duration}s",
+                    flush=True
+                )
+
+
             except Exception as e:
 
                 print(
-                    f"Failed to extract video metadata: {e}",
+                    f"Failed to extract "
+                    f"video metadata: {e}",
                     flush=True
                 )
 
@@ -678,6 +1066,7 @@ async def main():
                             "RGB"
                         )
 
+
                         rgb_img.save(
                             TEMP_JPG,
                             "JPEG"
@@ -687,16 +1076,24 @@ async def main():
                     thumb_path = TEMP_JPG
 
 
+                    print(
+                        f"[{index}/{total_items}] "
+                        f"Thumbnail ready.",
+                        flush=True
+                    )
+
+
                 except Exception as e:
 
                     print(
-                        f"Failed to process image thumbnail: {e}",
+                        f"Failed to process "
+                        f"image thumbnail: {e}",
                         flush=True
                     )
 
 
             # ==========================================
-            # UPLOAD
+            # UPLOAD TO TELEGRAM
             # ==========================================
 
             print(
@@ -740,12 +1137,17 @@ async def main():
 
 
             # ==========================================
-            # ONLY MARK COMPLETED AFTER SUCCESS
+            # MARK COMPLETED
             # ==========================================
 
-            save_completed(title)
+            save_completed(
+                title
+            )
 
-            already_done.add(title)
+
+            already_done.add(
+                title
+            )
 
 
             print(
@@ -754,6 +1156,7 @@ async def main():
                 flush=True
             )
 
+
             print(
                 f"[COMPLETED] {title}",
                 flush=True
@@ -761,7 +1164,7 @@ async def main():
 
 
         # ==========================================
-        # FLOOD WAIT
+        # TELEGRAM FLOOD WAIT
         # ==========================================
 
         except FloodWaitError as e:
@@ -772,12 +1175,13 @@ async def main():
                 flush=True
             )
 
+
             await asyncio.sleep(
                 e.seconds + 5
             )
 
-            # Do NOT mark as completed.
-            # The item will be retried after restart.
+
+            # Do NOT mark completed.
 
 
         # ==========================================
@@ -819,11 +1223,15 @@ async def main():
                 TEMP_JPG
             ]:
 
-                if os.path.exists(temp):
+                if os.path.exists(
+                    temp
+                ):
 
                     try:
 
-                        os.remove(temp)
+                        os.remove(
+                            temp
+                        )
 
                     except Exception as e:
 
@@ -834,14 +1242,24 @@ async def main():
                         )
 
 
-        await asyncio.sleep(5)
+        # ==========================================
+        # SMALL DELAY
+        # ==========================================
+
+        await asyncio.sleep(
+            5
+        )
 
 
 # ==========================================
-# 5. ENTRY POINT
+# 12. ENTRY POINT
 # ==========================================
 
 if __name__ == "__main__":
+
+    # ==========================================
+    # CHECK SESSION
+    # ==========================================
 
     if not SESSION_STRING:
 
@@ -852,15 +1270,24 @@ if __name__ == "__main__":
             flush=True
         )
 
+
         exit(1)
 
 
-    # Start Flask server
+    # ==========================================
+    # START FLASK
+    # ==========================================
+
     threading.Thread(
         target=run_web_server,
         daemon=True
     ).start()
 
 
-    # Start uploader
-    asyncio.run(main())
+    # ==========================================
+    # START UPLOADER
+    # ==========================================
+
+    asyncio.run(
+        main()
+    )
