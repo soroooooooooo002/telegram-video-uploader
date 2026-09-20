@@ -68,14 +68,13 @@ CHANNEL_ID = os.getenv(
     ""
 )
 
-# Optional on Vorao.
-# Leave empty if you are not using Render.
+# Optional.
+# Leave empty when using Vorao.
 RENDER_EXTERNAL_URL = os.getenv(
     "RENDER_EXTERNAL_URL",
     ""
 )
 
-# Telegram group link
 GROUP_LINK = os.getenv(
     "GROUP_LINK",
     "https://t.me/+T_s1eAvQfykzNmM1"
@@ -84,6 +83,25 @@ GROUP_LINK = os.getenv(
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
     CHANNEL_ID = int(CHANNEL_ID)
+
+
+# ==========================================
+# TELEGRAM CHANNEL SCAN SETTINGS
+# ==========================================
+
+# Number of recent Telegram messages to scan.
+#
+# 2000 is much faster than scanning the entire
+# channel every startup.
+#
+# Increase this if your channel contains more
+# than 2000 recent uploaded files.
+CHANNEL_SCAN_LIMIT = int(
+    os.getenv(
+        "CHANNEL_SCAN_LIMIT",
+        "2000"
+    )
+)
 
 
 # ==========================================
@@ -119,10 +137,6 @@ client = TelegramClient(
 # ==========================================
 
 def keep_alive():
-    """
-    Optional keep-alive.
-    Only runs if RENDER_EXTERNAL_URL is configured.
-    """
 
     while True:
 
@@ -149,17 +163,10 @@ def keep_alive():
 # 4. DOWNLOAD FILE
 # ==========================================
 
-def download_file_in_chunks(url, target_path):
-    """
-    Downloads a file in chunks.
-
-    Includes:
-    - HTTP status checking
-    - Separate connection/read timeout
-    - Download progress
-    - File size reporting
-    - Better error messages
-    """
+def download_file_in_chunks(
+    url,
+    target_path
+):
 
     headers = {
         "User-Agent": (
@@ -172,14 +179,11 @@ def download_file_in_chunks(url, target_path):
         )
     }
 
-    # Keep URL characters safe.
     safe_url = urllib.parse.quote(
         url,
         safe=":/%?=&-"
     )
 
-    # 20 seconds connection timeout
-    # 60 seconds read timeout
     timeout = (
         20,
         60
@@ -199,20 +203,12 @@ def download_file_in_chunks(url, target_path):
             timeout=timeout
         ) as r:
 
-            # ----------------------------------
-            # HTTP STATUS
-            # ----------------------------------
-
             r.raise_for_status()
 
             print(
                 f"[Download] HTTP {r.status_code}",
                 flush=True
             )
-
-            # ----------------------------------
-            # TOTAL FILE SIZE
-            # ----------------------------------
 
             total_size = int(
                 r.headers.get(
@@ -238,20 +234,12 @@ def download_file_in_chunks(url, target_path):
                     flush=True
                 )
 
-            # ----------------------------------
-            # OPEN TEMP FILE
-            # ----------------------------------
-
             with open(
                 target_path,
                 "wb"
             ) as f:
 
                 last_report = time.time()
-
-                # ----------------------------------
-                # DOWNLOAD LOOP
-                # ----------------------------------
 
                 for chunk in r.iter_content(
                     chunk_size=1024 * 1024
@@ -263,10 +251,6 @@ def download_file_in_chunks(url, target_path):
                     f.write(chunk)
 
                     downloaded += len(chunk)
-
-                    # ----------------------------------
-                    # PRINT PROGRESS EVERY 5 SECONDS
-                    # ----------------------------------
 
                     now = time.time()
 
@@ -310,10 +294,6 @@ def download_file_in_chunks(url, target_path):
 
                         last_report = now
 
-            # ----------------------------------
-            # DOWNLOAD COMPLETE
-            # ----------------------------------
-
             print(
                 f"[Download] Completed: "
                 f"{downloaded / (1024 * 1024):.2f} MB",
@@ -350,9 +330,10 @@ def download_file_in_chunks(url, target_path):
 # ==========================================
 
 def parse_blocks(file_path):
-    """Parses data.txt blocks."""
 
-    if not os.path.exists(file_path):
+    if not os.path.exists(
+        file_path
+    ):
 
         print(
             f"Error: Data file '{file_path}' not found!",
@@ -529,13 +510,19 @@ def save_failed(
 
 
 # ==========================================
-# 9. CHECK EXISTING TELEGRAM CHANNEL
+# 9. CHECK RECENT TELEGRAM CHANNEL MESSAGES
 # ==========================================
 
 async def get_existing_channel_titles():
 
     print(
-        "Checking existing channel messages...",
+        "Checking recent Telegram channel messages...",
+        flush=True
+    )
+
+    print(
+        f"Channel scan limit: "
+        f"{CHANNEL_SCAN_LIMIT} messages",
         flush=True
     )
 
@@ -545,16 +532,14 @@ async def get_existing_channel_titles():
 
     try:
 
+        # IMPORTANT:
+        # Instead of limit=None, only scan recent messages.
         async for message in client.iter_messages(
             CHANNEL_ID,
-            limit=None
+            limit=CHANNEL_SCAN_LIMIT
         ):
 
             scanned += 1
-
-            # ----------------------------------
-            # READ MESSAGE CAPTION
-            # ----------------------------------
 
             if message.message:
 
@@ -566,10 +551,7 @@ async def get_existing_channel_titles():
                         text.splitlines()[0].strip()
                     )
 
-                    # ----------------------------------
-                    # REMOVE MARKDOWN BOLD
-                    # ----------------------------------
-
+                    # Remove Markdown bold
                     if (
                         first_line.startswith("**")
                         and first_line.endswith("**")
@@ -585,20 +567,14 @@ async def get_existing_channel_titles():
                             first_line
                         )
 
-            # ----------------------------------
-            # PROGRESS
-            # ----------------------------------
-
-            if scanned % 10000 == 0:
+            # Progress every 500 messages
+            if scanned % 500 == 0:
 
                 print(
+                    f"[Channel Scan] "
                     f"Scanned {scanned} messages...",
                     flush=True
                 )
-
-    # ==========================================
-    # FLOOD WAIT
-    # ==========================================
 
     except FloodWaitError as e:
 
@@ -614,10 +590,6 @@ async def get_existing_channel_titles():
 
         return await get_existing_channel_titles()
 
-    # ==========================================
-    # OTHER ERROR
-    # ==========================================
-
     except Exception as e:
 
         print(
@@ -627,18 +599,15 @@ async def get_existing_channel_titles():
 
         return existing_titles
 
-    # ==========================================
-    # RESULT
-    # ==========================================
-
     print(
-        f"Resume check completed. "
-        f"Scanned {scanned} channel messages.",
+        f"[Channel Scan] Completed. "
+        f"Scanned {scanned} messages.",
         flush=True
     )
 
     print(
-        f"Found {len(existing_titles)} existing titles.",
+        f"[Channel Scan] Found "
+        f"{len(existing_titles)} existing titles.",
         flush=True
     )
 
@@ -653,12 +622,6 @@ def telegram_upload_progress(
     current,
     total
 ):
-    """
-    Telethon upload progress callback.
-
-    current = bytes uploaded
-    total   = total bytes
-    """
 
     if total <= 0:
         return
@@ -677,15 +640,12 @@ def telegram_upload_progress(
         / (1024 * 1024)
     )
 
-    # Store last printed percentage.
-    # This prevents thousands of log lines.
     last_percent = getattr(
         telegram_upload_progress,
         "_last_percent",
         -1
     )
 
-    # Print every 5%
     current_step = int(
         percent // 5
     ) * 5
@@ -695,7 +655,9 @@ def telegram_upload_progress(
         or percent >= 100
     ):
 
-        telegram_upload_progress._last_percent = current_step
+        telegram_upload_progress._last_percent = (
+            current_step
+        )
 
         print(
             f"[Upload] "
@@ -717,10 +679,6 @@ async def main():
         flush=True
     )
 
-    # ==========================================
-    # CONNECT TELEGRAM
-    # ==========================================
-
     await client.connect()
 
     if not await client.is_user_authorized():
@@ -733,7 +691,7 @@ async def main():
 
         print(
             "Please generate a new SESSION_STRING "
-            "and update your Environment Variables.",
+            "and update Environment Variables.",
             flush=True
         )
 
@@ -809,6 +767,12 @@ async def main():
     already_done = (
         existing_titles |
         completed_titles
+    )
+
+    print(
+        f"Total known completed/existing titles: "
+        f"{len(already_done)}",
+        flush=True
     )
 
     # ==========================================
@@ -888,10 +852,6 @@ async def main():
         items,
         1
     ):
-
-        # --------------------------------------
-        # GET TITLE
-        # --------------------------------------
 
         title = item.get(
             "title",
@@ -1058,7 +1018,7 @@ async def main():
                 flush=True
             )
 
-            # Reset upload progress for this file.
+            # Reset progress
             telegram_upload_progress._last_percent = -1
 
             await client.send_file(
@@ -1091,11 +1051,9 @@ async def main():
 
                 ],
 
-                # ==========================================
-                # NEW: TELEGRAM UPLOAD PROGRESS
-                # ==========================================
-
-                progress_callback=telegram_upload_progress
+                progress_callback=(
+                    telegram_upload_progress
+                )
             )
 
             # ==========================================
@@ -1122,7 +1080,7 @@ async def main():
             )
 
         # ==========================================
-        # TELEGRAM FLOOD WAIT
+        # FLOOD WAIT
         # ==========================================
 
         except FloodWaitError as e:
@@ -1136,8 +1094,6 @@ async def main():
             await asyncio.sleep(
                 e.seconds + 5
             )
-
-            # Do NOT mark completed.
 
         # ==========================================
         # OTHER ERRORS
@@ -1208,10 +1164,6 @@ async def main():
 
 if __name__ == "__main__":
 
-    # ==========================================
-    # CHECK SESSION
-    # ==========================================
-
     if not SESSION_STRING:
 
         print(
@@ -1223,18 +1175,10 @@ if __name__ == "__main__":
 
         exit(1)
 
-    # ==========================================
-    # START FLASK
-    # ==========================================
-
     threading.Thread(
         target=run_web_server,
         daemon=True
     ).start()
-
-    # ==========================================
-    # START UPLOADER
-    # ==========================================
 
     asyncio.run(
         main()
