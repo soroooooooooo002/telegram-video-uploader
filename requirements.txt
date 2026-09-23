@@ -1,6 +1,7 @@
 telethon
+cryptg
 flask
 requests
-Pillow
+pillow
 moviepy==1.0.3
-decorator<5.0.0
+numpy
