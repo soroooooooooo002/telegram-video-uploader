@@ -81,6 +81,12 @@ GROUP_LINK = os.getenv(
     "https://t.me/+T_s1eAvQfykzNmM1"
 )
 
+# Number of recent Telegram messages to check when resuming.
+# Avoids scanning the entire channel history on every restart.
+CHANNEL_SCAN_LIMIT = int(
+    os.getenv("CHANNEL_SCAN_LIMIT", "2000")
+)
+
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
     CHANNEL_ID = int(CHANNEL_ID)
@@ -547,7 +553,7 @@ async def get_existing_channel_titles():
 
         async for message in client.iter_messages(
             CHANNEL_ID,
-            limit=None
+            limit=CHANNEL_SCAN_LIMIT
         ):
 
             scanned += 1
@@ -589,7 +595,7 @@ async def get_existing_channel_titles():
             # PROGRESS
             # ----------------------------------
 
-            if scanned % 10000 == 0:
+            if scanned % 500 == 0:
 
                 print(
                     f"Scanned {scanned} messages...",
@@ -1194,12 +1200,10 @@ async def main():
                         )
 
         # ==========================================
-        # SMALL DELAY
+        # NO FIXED DELAY
         # ==========================================
-
-        await asyncio.sleep(
-            5
-        )
+        # The next item starts immediately.
+        # Telegram FloodWait is handled separately above.
 
 
 # ==========================================
