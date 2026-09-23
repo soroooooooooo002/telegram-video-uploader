@@ -81,11 +81,8 @@ GROUP_LINK = os.getenv(
     "https://t.me/+T_s1eAvQfykzNmM1"
 )
 
-# Number of recent Telegram messages to check when resuming.
-# Avoids scanning the entire channel history on every restart.
-CHANNEL_SCAN_LIMIT = int(
-    os.getenv("CHANNEL_SCAN_LIMIT", "2000")
-)
+# Last successfully uploaded item in data.txt
+PROGRESS_INDEX_FILE = "progress_index.txt"
 
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
@@ -535,120 +532,53 @@ def save_failed(
 
 
 # ==========================================
-# 9. CHECK EXISTING TELEGRAM CHANNEL
+# 9. RESUME CHECKPOINT
 # ==========================================
 
-async def get_existing_channel_titles():
-
-    print(
-        "Checking existing channel messages...",
-        flush=True
-    )
-
-    existing_titles = set()
-
-    scanned = 0
+def load_progress_index():
+    if not os.path.exists(PROGRESS_INDEX_FILE):
+        return 0
 
     try:
+        with open(PROGRESS_INDEX_FILE, "r", encoding="utf-8") as f:
+            value = f.read().strip()
 
-        async for message in client.iter_messages(
-            CHANNEL_ID,
-            limit=CHANNEL_SCAN_LIMIT
-        ):
+        if not value:
+            return 0
 
-            scanned += 1
-
-            # ----------------------------------
-            # READ MESSAGE CAPTION
-            # ----------------------------------
-
-            if message.message:
-
-                text = message.message.strip()
-
-                if text:
-
-                    first_line = (
-                        text.splitlines()[0].strip()
-                    )
-
-                    # ----------------------------------
-                    # REMOVE MARKDOWN BOLD
-                    # ----------------------------------
-
-                    if (
-                        first_line.startswith("**")
-                        and first_line.endswith("**")
-                    ):
-
-                        first_line = first_line[
-                            2:-2
-                        ].strip()
-
-                    if first_line:
-
-                        existing_titles.add(
-                            first_line
-                        )
-
-            # ----------------------------------
-            # PROGRESS
-            # ----------------------------------
-
-            if scanned % 500 == 0:
-
-                print(
-                    f"Scanned {scanned} messages...",
-                    flush=True
-                )
-
-    # ==========================================
-    # FLOOD WAIT
-    # ==========================================
-
-    except FloodWaitError as e:
-
-        print(
-            f"FloodWait during channel scan. "
-            f"Waiting {e.seconds} seconds...",
-            flush=True
-        )
-
-        await asyncio.sleep(
-            e.seconds + 5
-        )
-
-        return await get_existing_channel_titles()
-
-    # ==========================================
-    # OTHER ERROR
-    # ==========================================
+        index = int(value)
+        return max(0, index)
 
     except Exception as e:
-
         print(
-            f"Channel scan failed: {e}",
+            f"[Resume] Could not read {PROGRESS_INDEX_FILE}: {e}",
+            flush=True
+        )
+        return 0
+
+
+def save_progress_index(index):
+    temp_file = PROGRESS_INDEX_FILE + ".tmp"
+
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(str(index))
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temp_file, PROGRESS_INDEX_FILE)
+
+    except Exception as e:
+        print(
+            f"[Resume] Could not save progress: {e}",
             flush=True
         )
 
-        return existing_titles
-
-    # ==========================================
-    # RESULT
-    # ==========================================
-
-    print(
-        f"Resume check completed. "
-        f"Scanned {scanned} channel messages.",
-        flush=True
-    )
-
-    print(
-        f"Found {len(existing_titles)} existing titles.",
-        flush=True
-    )
-
-    return existing_titles
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
 
 
 # ==========================================
@@ -801,45 +731,29 @@ async def main():
         )
 
     # ==========================================
-    # CHECK TELEGRAM CHANNEL
+    # LOAD RESUME CHECKPOINT
     # ==========================================
 
-    existing_titles = (
-        await get_existing_channel_titles()
+    last_completed_index = load_progress_index()
+
+    if last_completed_index > total_items:
+        last_completed_index = total_items
+
+    start_index = last_completed_index + 1
+
+    print(
+        f"[Resume] Last successfully uploaded: "
+        f"{last_completed_index}/{total_items}",
+        flush=True
     )
 
-    # ==========================================
-    # COMBINE COMPLETED SOURCES
-    # ==========================================
-
-    already_done = (
-        existing_titles |
-        completed_titles
-    )
-
-    # ==========================================
-    # FIND FIRST MISSING ITEM
-    # ==========================================
-
-    start_index = (
-        total_items + 1
-    )
-
-    for index, item in enumerate(
-        items,
-        1
-    ):
-
-        title = item.get(
-            "title",
-            "Untitled Video"
-        ).strip()
-
-        if title not in already_done:
-
-            start_index = index
-
-            break
+    if start_index <= total_items:
+        print(
+            f"[Resume] Starting immediately from item "
+            f"{start_index}/{total_items}: "
+            f"{items[start_index - 1].get('title', 'Untitled Video')}",
+            flush=True
+        )
 
     # ==========================================
     # NOTHING LEFT
@@ -895,6 +809,9 @@ async def main():
         1
     ):
 
+        if index < start_index:
+            continue
+
         # --------------------------------------
         # GET TITLE
         # --------------------------------------
@@ -903,14 +820,6 @@ async def main():
             "title",
             "Untitled Video"
         ).strip()
-
-        # --------------------------------------
-        # SKIP ALREADY COMPLETED
-        # --------------------------------------
-
-        if title in already_done:
-
-            continue
 
         # --------------------------------------
         # GET URLS
@@ -1112,9 +1021,8 @@ async def main():
                 title
             )
 
-            already_done.add(
-                title
-            )
+            # Advance only after Telegram upload succeeds.
+            save_progress_index(index)
 
             print(
                 f"[{index}/{total_items}] "
@@ -1202,8 +1110,8 @@ async def main():
         # ==========================================
         # NO FIXED DELAY
         # ==========================================
-        # The next item starts immediately.
-        # Telegram FloodWait is handled separately above.
+        # Start the next item immediately.
+        # Telegram FloodWait is handled separately.
 
 
 # ==========================================
