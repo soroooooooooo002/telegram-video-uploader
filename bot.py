@@ -425,7 +425,56 @@ def parse_blocks(file_path):
 
 
 # ==========================================
-# 6. LOAD COMPLETED
+# 6. DELETE SUCCESSFULLY UPLOADED BLOCK
+# ==========================================
+
+def delete_uploaded_block(file_path, target_url):
+    delimiter = "=" * 80
+    if not os.path.exists(file_path):
+        raise RuntimeError(f"Data file '{file_path}' not found.")
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if delimiter in content:
+        raw_blocks = content.split(delimiter)
+        delimiter_mode = True
+    else:
+        raw_blocks = content.split("\n\n")
+        delimiter_mode = False
+    target_url = target_url.strip()
+    target_index = None
+    for i, raw_block in enumerate(raw_blocks):
+        block = raw_block.strip()
+        if not block:
+            continue
+        data = {}
+        for line in block.splitlines():
+            if ":" in line:
+                key, val = line.split(":", 1)
+                data[key.strip()] = val.strip()
+        if data.get("file_url", "").strip() == target_url:
+            target_index = i
+            break
+    if target_index is None:
+        raise RuntimeError("Uploaded block was not found in data.txt. The block was NOT deleted.")
+    del raw_blocks[target_index]
+    new_content = delimiter.join(raw_blocks) if delimiter_mode else "\n\n".join(raw_blocks)
+    temp_path = file_path + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, file_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except Exception: pass
+        raise
+    print(f"[Queue] Successfully uploaded block deleted from {file_path}.", flush=True)
+
+
+# ==========================================
+# 7. LOAD COMPLETED
 # ==========================================
 
 def load_completed():
@@ -1021,7 +1070,13 @@ async def main():
                 title
             )
 
-            # Advance only after Telegram upload succeeds.
+            # Delete the exact block only after Telegram upload succeeds.
+            delete_uploaded_block(
+                "data.txt",
+                file_url
+            )
+
+            # Keep the existing checkpoint behavior unchanged.
             save_progress_index(index)
 
             print(
