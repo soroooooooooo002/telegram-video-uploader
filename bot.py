@@ -1181,22 +1181,14 @@ async def main():
                     continue
 
                 save_failed(index, title, file_url, str(e))
-
-                if SKIP_FAILED:
-                    save_progress_index(index)
-                    print(
-                        f"[FAILED] Item {index} skipped after "
-                        f"{MAX_RETRIES} attempts (SKIP_FAILED=1).",
-                        flush=True
-                    )
-                    break
-
+                save_progress_index(index)
                 print(
-                    f"[STOPPED] Item {index} hit FloodWait on all "
-                    f"{MAX_RETRIES} attempts. It will be retried on restart.",
+                    f"[SKIPPED] Item {index} ({title}) reached "
+                    f"{MAX_RETRIES} FloodWait attempts. Continuing to the next item.",
                     flush=True
                 )
-                raise SystemExit(1)
+                # Exit this item's retry loop; the outer for-loop advances.
+                break
 
             # ==========================================
             # OTHER ERRORS / SKIPPED ITEMS
@@ -1228,26 +1220,17 @@ async def main():
                     str(e)
                 )
 
-                if SKIP_FAILED:
-
-                    save_progress_index(index)
-
-                    print(
-                        f"[FAILED] Item {index} skipped "
-                        f"(SKIP_FAILED=1).",
-                        flush=True
-                    )
-
-                    break
-
+                # Mark this item as processed for resume purposes so a
+                # restart cannot get stuck retrying this same broken item.
+                # It remains recorded in failed.txt for manual retry later.
+                save_progress_index(index)
                 print(
-                    f"[STOPPED] Item {index} failed {MAX_RETRIES} "
-                    f"times. Checkpoint stays before it; next start "
-                    f"resumes from item {index}.",
+                    f"[SKIPPED] Item {index} ({title}) failed "
+                    f"{MAX_RETRIES} times. Continuing to the next item.",
                     flush=True
                 )
-
-                raise SystemExit(1)
+                # Exit this item's retry loop; the outer for-loop advances.
+                break
 
             # ==========================================
             # CLEAN TEMP FILES
