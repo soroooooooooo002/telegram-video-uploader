@@ -84,29 +84,28 @@ GROUP_LINK = os.getenv(
 # ==========================================
 # CHECKPOINT (no external database)
 # ==========================================
-# Resume position = the highest of:
-#   1. START_FROM env var (items already uploaded)
-#   2. local checkpoint.txt (if the disk survives restarts)
-#   3. the newest matching video found in the Telegram channel
+# START_FROM is the 1-based item number to begin with on a fresh run.
+# checkpoint.txt stores the LAST successfully uploaded item number.
+# On restart, resume after the highest confirmed progress from:
+#   1. checkpoint.txt
+#   2. matching recent Telegram channel posts
+#   3. START_FROM - 1 (the initial starting point)
 # data.txt is only ever READ, never modified.
 
 PROGRESS_INDEX_FILE = "checkpoint.txt"
 
-# Retry behaviour for a failing item.
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5") or 5)
-RETRY_DELAY = int(os.getenv("RETRY_DELAY", "20") or 20)
+# Maximum total attempts per item, including FloodWait retries.
+MAX_RETRIES = max(1, int(os.getenv("MAX_RETRIES", "3") or 3))
+RETRY_DELAY = max(0, int(os.getenv("RETRY_DELAY", "20") or 20))
 
 # 0 (default): if an item keeps failing, stop and resume from the
 #              SAME item on the next start.
 # 1          : skip the broken item and continue with the next one.
 SKIP_FAILED = os.getenv("SKIP_FAILED", "0") == "1"
 
-START_FROM = int(
-    os.getenv(
-        "START_FROM",
-        "0"
-    ) or 0
-)
+# This is the item number to START WITH, not the last completed item.
+# Example: START_FROM=890 begins at item 890 if no newer progress exists.
+START_FROM = max(1, int(os.getenv("START_FROM", "1") or 1))
 
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
@@ -821,7 +820,10 @@ async def main():
 
     local_index = load_progress_index()
 
-    baseline = max(local_index, START_FROM)
+    # START_FROM is the first item to upload. Convert it to the previous
+    # completed index so START_FROM=890 actually begins with item 890.
+    start_from_baseline = START_FROM - 1
+    baseline = max(local_index, start_from_baseline)
 
     channel_index = await find_resume_index_from_channel(
         items,
@@ -829,13 +831,16 @@ async def main():
     )
 
     print(
-        f"[Resume] local={local_index}, START_FROM={START_FROM}, "
-        f"channel={channel_index}",
+        f"[Resume] local_last_completed={local_index}, "
+        f"START_FROM={START_FROM}, channel_last_match={channel_index}",
         flush=True
     )
 
+    # Persisted/channel progress takes precedence over the initial START_FROM.
+    # If item 995 was uploaded, the next run begins at item 996.
     last_completed_index = max(
-        baseline,
+        local_index,
+        start_from_baseline,
         channel_index
     )
 
@@ -1161,18 +1166,37 @@ async def main():
 
             except FloodWaitError as e:
 
+                attempt += 1
+
                 print(
-                    f"Rate limited by Telegram. "
-                    f"Waiting {e.seconds} seconds...",
+                    f"Telegram FloodWait for item {index}. "
+                    f"Attempt {attempt}/{MAX_RETRIES}; waiting "
+                    f"{e.seconds} seconds...",
                     flush=True
                 )
 
-                # Wait, then retry the SAME item (not skipped).
-                await asyncio.sleep(
-                    e.seconds + 5
-                )
+                if attempt < MAX_RETRIES:
+                    # Retry the SAME item after Telegram's requested cooldown.
+                    await asyncio.sleep(e.seconds + 5)
+                    continue
 
-                continue
+                save_failed(index, title, file_url, str(e))
+
+                if SKIP_FAILED:
+                    save_progress_index(index)
+                    print(
+                        f"[FAILED] Item {index} skipped after "
+                        f"{MAX_RETRIES} attempts (SKIP_FAILED=1).",
+                        flush=True
+                    )
+                    break
+
+                print(
+                    f"[STOPPED] Item {index} hit FloodWait on all "
+                    f"{MAX_RETRIES} attempts. It will be retried on restart.",
+                    flush=True
+                )
+                raise SystemExit(1)
 
             # ==========================================
             # OTHER ERRORS / SKIPPED ITEMS
