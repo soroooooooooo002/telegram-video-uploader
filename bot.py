@@ -1,9 +1,9 @@
 import asyncio
+import base64
 import os
 import threading
 import time
 import urllib.parse
-
 from flask import Flask
 from PIL import Image
 import requests
@@ -82,31 +82,23 @@ GROUP_LINK = os.getenv(
 )
 
 # ==========================================
-# CHECKPOINT (no external database)
+# MANUAL RESUME + GITHUB PROGRESS LEDGER
 # ==========================================
-# START_FROM is the 1-based item number to begin with on a fresh run.
-# checkpoint.txt stores the LAST successfully uploaded item number.
-# On restart, resume after the highest confirmed progress from:
-#   1. checkpoint.txt
-#   2. matching recent Telegram channel posts
-#   3. START_FROM - 1 (the initial starting point)
-# data.txt is only ever READ, never modified.
+# Set START_FROM manually to the 1-based item number you want to process.
+# The bot does NOT auto-resume from local files or Telegram channel history.
+# Every uploaded/skipped item is recorded in GitHub's already_uploaded.txt.
 
-PROGRESS_INDEX_FILE = "checkpoint.txt"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "").strip()  # owner/repository
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
+GITHUB_PROGRESS_FILE = "already_uploaded.txt"
 
-# Maximum total attempts per item, including FloodWait retries.
-MAX_RETRIES = max(1, int(os.getenv("MAX_RETRIES", "3") or 3))
+# One attempt only. Failed items are recorded as SKIPPED and the bot continues.
+MAX_RETRIES = 1
 RETRY_DELAY = max(0, int(os.getenv("RETRY_DELAY", "20") or 20))
 
-# 0 (default): if an item keeps failing, stop and resume from the
-#              SAME item on the next start.
-# 1          : skip the broken item and continue with the next one.
-SKIP_FAILED = os.getenv("SKIP_FAILED", "0") == "1"
-
-# This is the item number to START WITH, not the last completed item.
-# Example: START_FROM=890 begins at item 890 if no newer progress exists.
+# This is the exact 1-based item number to start from on every deployment.
 START_FROM = max(1, int(os.getenv("START_FROM", "1") or 1))
-
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
     CHANNEL_ID = int(CHANNEL_ID)
@@ -555,114 +547,83 @@ def save_failed(
 
 
 # ==========================================
-# 9. RESUME CHECKPOINT
+# 9. GITHUB PROGRESS LEDGER
 # ==========================================
 
-def load_progress_index():
-    """Read the local checkpoint (0 if missing)."""
+def github_headers():
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_progress_url():
+    if not GITHUB_REPOSITORY or "/" not in GITHUB_REPOSITORY:
+        return None
+    owner, repo = GITHUB_REPOSITORY.split("/", 1)
+    return (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{urllib.parse.quote(GITHUB_PROGRESS_FILE)}"
+    )
+
+
+def save_processed_item(index, status, title, details=""):
+    """Append/update one item in the GitHub ledger; local disk is not the source of truth."""
+    url = github_progress_url()
+    if not GITHUB_TOKEN or not url:
+        print(
+            "[GitHub] Progress NOT saved: configure GITHUB_TOKEN and "
+            "GITHUB_REPOSITORY (owner/repository).",
+            flush=True,
+        )
+        return False
+
+    clean_title = " ".join(str(title).replace("\t", " ").replace("\r", " ").replace("\n", " ").split())
+    clean_details = " ".join(str(details).replace("\t", " ").replace("\r", " ").replace("\n", " ").split())
+    new_line = f"{int(index)}\t{status}\t{clean_title}"
+    if clean_details:
+        new_line += f"\t{clean_details}"
 
     try:
+        response = requests.get(
+            url,
+            headers=github_headers(),
+            params={"ref": GITHUB_BRANCH},
+            timeout=20,
+        )
 
-        with open(
-            PROGRESS_INDEX_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+        sha = None
+        lines = []
+        if response.status_code == 200:
+            payload = response.json()
+            sha = payload.get("sha")
+            existing = base64.b64decode(payload.get("content", "")).decode("utf-8", errors="replace")
+            lines = [line for line in existing.splitlines() if line.strip()]
+        elif response.status_code != 404:
+            response.raise_for_status()
 
-            return max(
-                0,
-                int(f.read().strip() or 0)
-            )
+        prefix = f"{int(index)}\t"
+        lines = [line for line in lines if not line.startswith(prefix)]
+        lines.append(new_line)
+        content = ("\n".join(lines) + "\n").encode("utf-8")
 
-    except FileNotFoundError:
+        body = {
+            "message": f"Track item {index}: {status}",
+            "content": base64.b64encode(content).decode("ascii"),
+            "branch": GITHUB_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
 
-        return 0
+        saved = requests.put(url, headers=github_headers(), json=body, timeout=20)
+        saved.raise_for_status()
+        print(f"[GitHub] Saved item {index}: {status}", flush=True)
+        return True
 
     except Exception as e:
-
-        print(
-            f"[Resume] Could not read "
-            f"{PROGRESS_INDEX_FILE}: {e}",
-            flush=True
-        )
-
-        return 0
-
-
-def save_progress_index(index):
-    """Write the local checkpoint. Never crashes the bot."""
-
-    try:
-
-        with open(
-            PROGRESS_INDEX_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(str(int(index)))
-
-        print(
-            f"[Resume] Checkpoint saved: {index}",
-            flush=True
-        )
-
-    except Exception as e:
-
-        print(
-            f"[Resume] Could not save checkpoint: {e}",
-            flush=True
-        )
-
-
-async def find_resume_index_from_channel(items, baseline):
-    """
-    Looks at the newest channel posts and finds which data.txt
-    item was uploaded last (matched by title in the caption).
-    Returns that item's index, or 0 if nothing matches.
-    This makes resume work even if the host disk is wiped.
-    """
-
-    title_map = {}
-
-    for i, it in enumerate(items, 1):
-
-        t = it.get("title", "Untitled Video").strip()
-
-        title_map.setdefault(t, []).append(i)
-
-    try:
-
-        async for msg in client.iter_messages(
-            CHANNEL_ID,
-            limit=30
-        ):
-
-            text = (msg.raw_text or "").strip()
-
-            if not text:
-                continue
-
-            first_line = text.split("\n")[0].strip()
-
-            if first_line in title_map:
-
-                candidates = title_map[first_line]
-
-                # Duplicate titles: pick the one nearest to baseline.
-                return min(
-                    candidates,
-                    key=lambda i: abs(i - baseline)
-                )
-
-    except Exception as e:
-
-        print(
-            f"[Resume] Channel scan failed (ignored): {e}",
-            flush=True
-        )
-
-    return 0
+        print(f"[GitHub] Could not save item {index} progress: {e}", flush=True)
+        return False
 
 
 # ==========================================
@@ -801,71 +762,23 @@ async def main():
         return
 
     # ==========================================
-    # LOAD LOCAL COMPLETED LIST
+    # MANUAL RESUME POSITION
     # ==========================================
+    # START_FROM is used exactly as configured. The GitHub ledger is for
+    # viewing progress only; it does not automatically change this start index.
+    start_index = START_FROM
 
-    completed_titles = load_completed()
+    print(
+        f"[Resume] Manual START_FROM={START_FROM}; "
+        f"GitHub progress file: {GITHUB_PROGRESS_FILE}",
+        flush=True,
+    )
 
-    if completed_titles:
-
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         print(
-            f"Loaded {len(completed_titles)} "
-            f"completed items from completed.txt.",
-            flush=True
-        )
-
-    # ==========================================
-    # LOAD RESUME CHECKPOINT
-    # ==========================================
-
-    local_index = load_progress_index()
-
-    # START_FROM is the first item to upload. Convert it to the previous
-    # completed index so START_FROM=890 actually begins with item 890.
-    start_from_baseline = START_FROM - 1
-    baseline = max(local_index, start_from_baseline)
-
-    channel_index = await find_resume_index_from_channel(
-        items,
-        baseline
-    )
-
-    print(
-        f"[Resume] local_last_completed={local_index}, "
-        f"START_FROM={START_FROM}, channel_last_match={channel_index}",
-        flush=True
-    )
-
-    # Persisted/channel progress takes precedence over the initial START_FROM.
-    # If item 995 was uploaded, the next run begins at item 996.
-    last_completed_index = max(
-        local_index,
-        start_from_baseline,
-        channel_index
-    )
-
-    if last_completed_index > total_items:
-        last_completed_index = total_items
-
-    start_index = last_completed_index + 1
-
-    print(
-        f"[Resume] Checkpoint file: {PROGRESS_INDEX_FILE}",
-        flush=True
-    )
-
-    print(
-        f"[Resume] Last processed item: "
-        f"{last_completed_index}/{total_items}",
-        flush=True
-    )
-
-    if start_index <= total_items:
-        print(
-            f"[Resume] Starting immediately from item "
-            f"{start_index}/{total_items}: "
-            f"{items[start_index - 1].get('title', 'Untitled Video')}",
-            flush=True
+            "[GitHub] WARNING: GITHUB_TOKEN and GITHUB_REPOSITORY must be set "
+            "for progress to be stored in GitHub.",
+            flush=True,
         )
 
     # ==========================================
@@ -901,7 +814,7 @@ async def main():
     # ==========================================
 
     print(
-        f"First missing item found: "
+        f"Starting item: "
         f"{start_index}/{total_items} - "
         f"{items[start_index - 1].get('title', 'Untitled Video')}",
         flush=True
@@ -1140,12 +1053,8 @@ async def main():
                 # MARK COMPLETED
                 # ==========================================
 
-                save_completed(
-                    title
-                )
-
-                # Upload succeeded: permanently mark this index processed.
-                save_progress_index(index)
+                # Upload succeeded: record it in GitHub.
+                save_processed_item(index, "UPLOADED", title)
 
                 print(
                     f"[{index}/{total_items}] "
@@ -1170,8 +1079,8 @@ async def main():
 
                 print(
                     f"Telegram FloodWait for item {index}. "
-                    f"Attempt {attempt}/{MAX_RETRIES}; waiting "
-                    f"{e.seconds} seconds...",
+                    f"Attempt {attempt}/{MAX_RETRIES}; "
+                    f"FloodWait encountered.",
                     flush=True
                 )
 
@@ -1180,8 +1089,7 @@ async def main():
                     await asyncio.sleep(e.seconds + 5)
                     continue
 
-                save_failed(index, title, file_url, str(e))
-                save_progress_index(index)
+                save_processed_item(index, "SKIPPED", title, str(e))
                 print(
                     f"[SKIPPED] Item {index} ({title}) reached "
                     f"{MAX_RETRIES} FloodWait attempts. Continuing to the next item.",
@@ -1213,17 +1121,8 @@ async def main():
 
                     continue
 
-                save_failed(
-                    index,
-                    title,
-                    file_url,
-                    str(e)
-                )
-
-                # Mark this item as processed for resume purposes so a
-                # restart cannot get stuck retrying this same broken item.
-                # It remains recorded in failed.txt for manual retry later.
-                save_progress_index(index)
+                # Record the skipped item in GitHub and continue.
+                save_processed_item(index, "SKIPPED", title, str(e))
                 print(
                     f"[SKIPPED] Item {index} ({title}) failed "
                     f"{MAX_RETRIES} times. Continuing to the next item.",
