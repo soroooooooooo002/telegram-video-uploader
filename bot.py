@@ -82,28 +82,31 @@ GROUP_LINK = os.getenv(
 )
 
 # ==========================================
-# SUPABASE PERSISTENT CHECKPOINT
+# CHECKPOINT (no external database)
 # ==========================================
-# Render Free filesystem is temporary, so the
-# resume checkpoint is stored in Supabase.
-SUPABASE_URL = os.getenv(
-    "SUPABASE_URL",
-    ""
-).rstrip("/")
+# Resume position = the highest of:
+#   1. START_FROM env var (items already uploaded)
+#   2. local checkpoint.txt (if the disk survives restarts)
+#   3. the newest matching video found in the Telegram channel
+# data.txt is only ever READ, never modified.
 
-SUPABASE_KEY = os.getenv(
-    "SUPABASE_KEY",
-    ""
+PROGRESS_INDEX_FILE = "checkpoint.txt"
+
+# Retry behaviour for a failing item.
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5") or 5)
+RETRY_DELAY = int(os.getenv("RETRY_DELAY", "20") or 20)
+
+# 0 (default): if an item keeps failing, stop and resume from the
+#              SAME item on the next start.
+# 1          : skip the broken item and continue with the next one.
+SKIP_FAILED = os.getenv("SKIP_FAILED", "0") == "1"
+
+START_FROM = int(
+    os.getenv(
+        "START_FROM",
+        "0"
+    ) or 0
 )
-
-SUPABASE_BOT_ID = os.getenv(
-    "SUPABASE_BOT_ID",
-    "telegram-uploader"
-)
-
-# Local file is intentionally NOT used for the
-# resume checkpoint anymore.
-PROGRESS_INDEX_FILE = "supabase:telegram_uploader_progress"
 
 
 if CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit():
@@ -556,168 +559,111 @@ def save_failed(
 # 9. RESUME CHECKPOINT
 # ==========================================
 
-def _supabase_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
 def load_progress_index():
-    """
-    Load the checkpoint from Supabase.
+    """Read the local checkpoint (0 if missing)."""
 
-    A missing row means this bot has never stored
-    a checkpoint and therefore starts at item 1.
-    API failures stop the bot instead of risking
-    an accidental restart from item 0.
-    """
+    try:
 
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError(
-            "SUPABASE_URL or SUPABASE_KEY is missing."
+        with open(
+            PROGRESS_INDEX_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            return max(
+                0,
+                int(f.read().strip() or 0)
+            )
+
+    except FileNotFoundError:
+
+        return 0
+
+    except Exception as e:
+
+        print(
+            f"[Resume] Could not read "
+            f"{PROGRESS_INDEX_FILE}: {e}",
+            flush=True
         )
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/"
-        f"telegram_uploader_progress"
-    )
-
-    params = {
-        "select": "progress_index",
-        "bot_id": f"eq.{SUPABASE_BOT_ID}",
-        "limit": "1",
-    }
-
-    last_error = None
-
-    for attempt in range(1, 4):
-
-        try:
-
-            response = requests.get(
-                url,
-                headers=_supabase_headers(),
-                params=params,
-                timeout=15
-            )
-
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-
-            rows = response.json()
-
-            if not rows:
-                print(
-                    "[Resume] No Supabase checkpoint found. "
-                    "Starting from item 1.",
-                    flush=True
-                )
-                return 0
-
-            index = int(
-                rows[0].get(
-                    "progress_index",
-                    0
-                )
-            )
-
-            return max(0, index)
-
-        except Exception as e:
-
-            last_error = e
-
-            print(
-                f"[Resume] Supabase read attempt "
-                f"{attempt}/3 failed: {e}",
-                flush=True
-            )
-
-            if attempt < 3:
-                time.sleep(2)
-
-    raise RuntimeError(
-        f"Could not read persistent checkpoint "
-        f"from Supabase: {last_error}"
-    )
+        return 0
 
 
 def save_progress_index(index):
-    """
-    Save the processed index to Supabase.
+    """Write the local checkpoint. Never crashes the bot."""
 
-    One row is maintained per SUPABASE_BOT_ID.
-    """
+    try:
 
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError(
-            "SUPABASE_URL or SUPABASE_KEY is missing."
+        with open(
+            PROGRESS_INDEX_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(str(int(index)))
+
+        print(
+            f"[Resume] Checkpoint saved: {index}",
+            flush=True
         )
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/"
-        f"telegram_uploader_progress"
-    )
+    except Exception as e:
 
-    payload = {
-        "bot_id": SUPABASE_BOT_ID,
-        "progress_index": int(index),
-    }
+        print(
+            f"[Resume] Could not save checkpoint: {e}",
+            flush=True
+        )
 
-    headers = _supabase_headers()
-    headers["Prefer"] = (
-        "resolution=merge-duplicates,return=minimal"
-    )
 
-    last_error = None
+async def find_resume_index_from_channel(items, baseline):
+    """
+    Looks at the newest channel posts and finds which data.txt
+    item was uploaded last (matched by title in the caption).
+    Returns that item's index, or 0 if nothing matches.
+    This makes resume work even if the host disk is wiped.
+    """
 
-    for attempt in range(1, 4):
+    title_map = {}
 
-        try:
+    for i, it in enumerate(items, 1):
 
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
+        t = it.get("title", "Untitled Video").strip()
 
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
+        title_map.setdefault(t, []).append(i)
+
+    try:
+
+        async for msg in client.iter_messages(
+            CHANNEL_ID,
+            limit=30
+        ):
+
+            text = (msg.raw_text or "").strip()
+
+            if not text:
+                continue
+
+            first_line = text.split("\n")[0].strip()
+
+            if first_line in title_map:
+
+                candidates = title_map[first_line]
+
+                # Duplicate titles: pick the one nearest to baseline.
+                return min(
+                    candidates,
+                    key=lambda i: abs(i - baseline)
                 )
 
-            print(
-                f"[Resume] Persistent checkpoint saved: "
-                f"{index}",
-                flush=True
-            )
+    except Exception as e:
 
-            return
+        print(
+            f"[Resume] Channel scan failed (ignored): {e}",
+            flush=True
+        )
 
-        except Exception as e:
-
-            last_error = e
-
-            print(
-                f"[Resume] Supabase write attempt "
-                f"{attempt}/3 failed: {e}",
-                flush=True
-            )
-
-            if attempt < 3:
-                time.sleep(2)
-
-    raise RuntimeError(
-        f"Could not save persistent checkpoint "
-        f"{index} to Supabase: {last_error}"
-    )
+    return 0
 
 
 # ==========================================
@@ -873,7 +819,25 @@ async def main():
     # LOAD RESUME CHECKPOINT
     # ==========================================
 
-    last_completed_index = load_progress_index()
+    local_index = load_progress_index()
+
+    baseline = max(local_index, START_FROM)
+
+    channel_index = await find_resume_index_from_channel(
+        items,
+        baseline
+    )
+
+    print(
+        f"[Resume] local={local_index}, START_FROM={START_FROM}, "
+        f"channel={channel_index}",
+        flush=True
+    )
+
+    last_completed_index = max(
+        baseline,
+        channel_index
+    )
 
     if last_completed_index > total_items:
         last_completed_index = total_items
@@ -1002,265 +966,294 @@ async def main():
         width = 0
         height = 0
 
-        try:
+        attempt = 0
 
-            # ==========================================
-            # DOWNLOAD VIDEO
-            # ==========================================
+        while True:
 
-            print(
-                f"[{index}/{total_items}] "
-                f"Downloading Video: {title}...",
-                flush=True
-            )
-
-            download_file_in_chunks(
-                file_url,
-                TEMP_FILE
-            )
-
-            # ==========================================
-            # VIDEO METADATA
-            # ==========================================
+            # Fresh state for every attempt.
+            thumb_path = None
+            duration = 0
+            width = 0
+            height = 0
 
             try:
 
+                # ==========================================
+                # DOWNLOAD VIDEO
+                # ==========================================
+
                 print(
                     f"[{index}/{total_items}] "
-                    f"Reading video metadata...",
+                    f"Downloading Video: {title}...",
                     flush=True
                 )
 
-                with VideoFileClip(
+                download_file_in_chunks(
+                    file_url,
                     TEMP_FILE
-                ) as clip:
-
-                    duration = int(
-                        clip.duration
-                    )
-
-                    width = clip.w
-
-                    height = clip.h
-
-                print(
-                    f"[{index}/{total_items}] "
-                    f"Video metadata: "
-                    f"{width}x{height}, "
-                    f"{duration}s",
-                    flush=True
                 )
 
-            except Exception as e:
-
-                print(
-                    f"Failed to extract "
-                    f"video metadata: {e}",
-                    flush=True
-                )
-
-            # ==========================================
-            # THUMBNAIL
-            # ==========================================
-
-            if thumb_url:
+                # ==========================================
+                # VIDEO METADATA
+                # ==========================================
 
                 try:
 
                     print(
                         f"[{index}/{total_items}] "
-                        f"Downloading Thumbnail...",
+                        f"Reading video metadata...",
                         flush=True
                     )
 
-                    download_file_in_chunks(
-                        thumb_url,
-                        TEMP_WEBP
-                    )
+                    with VideoFileClip(
+                        TEMP_FILE
+                    ) as clip:
 
-                    with Image.open(
-                        TEMP_WEBP
-                    ) as img:
-
-                        rgb_img = img.convert(
-                            "RGB"
+                        duration = int(
+                            clip.duration
                         )
 
-                        rgb_img.save(
-                            TEMP_JPG,
-                            "JPEG"
-                        )
+                        width = clip.w
 
-                    thumb_path = TEMP_JPG
+                        height = clip.h
 
                     print(
                         f"[{index}/{total_items}] "
-                        f"Thumbnail ready.",
+                        f"Video metadata: "
+                        f"{width}x{height}, "
+                        f"{duration}s",
                         flush=True
                     )
 
                 except Exception as e:
 
                     print(
-                        f"Failed to process "
-                        f"image thumbnail: {e}",
+                        f"Failed to extract "
+                        f"video metadata: {e}",
                         flush=True
                     )
 
-            # ==========================================
-            # UPLOAD TO TELEGRAM
-            # ==========================================
-
-            print(
-                f"[{index}/{total_items}] "
-                f"Uploading to Telegram...",
-                flush=True
-            )
-
-            # Reset upload progress for this file.
-            telegram_upload_progress._last_percent = -1
-
-            await client.send_file(
-
-                CHANNEL_ID,
-
-                file=TEMP_FILE,
-
-                thumb=thumb_path,
-
-                caption=caption,
-
-                parse_mode="md",
-
-                supports_streaming=True,
-
-                attributes=[
-
-                    DocumentAttributeVideo(
-
-                        duration=duration,
-
-                        w=width,
-
-                        h=height,
-
-                        supports_streaming=True
-
-                    )
-
-                ],
-
                 # ==========================================
-                # NEW: TELEGRAM UPLOAD PROGRESS
+                # THUMBNAIL
                 # ==========================================
 
-                progress_callback=telegram_upload_progress
-            )
-
-            # ==========================================
-            # MARK COMPLETED
-            # ==========================================
-
-            save_completed(
-                title
-            )
-
-            # Upload succeeded: permanently mark this index processed.
-            save_progress_index(index)
-
-            print(
-                f"[{index}/{total_items}] "
-                f"Uploaded successfully!",
-                flush=True
-            )
-
-            print(
-                f"[COMPLETED] {title}",
-                flush=True
-            )
-
-        # ==========================================
-        # TELEGRAM FLOOD WAIT
-        # ==========================================
-
-        except FloodWaitError as e:
-
-            print(
-                f"Rate limited by Telegram. "
-                f"Waiting {e.seconds} seconds...",
-                flush=True
-            )
-
-            # FloodWait is not treated as a failed/skipped item.
-            # Stop so this index can be retried safely.
-            await asyncio.sleep(
-                e.seconds + 5
-            )
-            break
-
-        # ==========================================
-        # OTHER ERRORS / SKIPPED ITEMS
-        # ==========================================
-
-        except Exception as e:
-
-            print(
-                f"Error processing item "
-                f"{index} ({title}): {e}",
-                flush=True
-            )
-
-            save_failed(
-                index,
-                title,
-                file_url,
-                str(e)
-            )
-
-            # Failed/skipped items also count as processed.
-            # The next restart continues from index + 1.
-            save_progress_index(index)
-
-            print(
-                f"[FAILED] Saved to {FAILED_FILE}",
-                flush=True
-            )
-
-            print(
-                f"[Resume] Checkpoint advanced to {index}. "
-                f"This item will NOT be retried automatically.",
-                flush=True
-            )
-
-        # ==========================================
-        # CLEAN TEMP FILES
-        # ==========================================
-
-        finally:
-
-            for temp in [
-                TEMP_FILE,
-                TEMP_WEBP,
-                TEMP_JPG
-            ]:
-
-                if os.path.exists(
-                    temp
-                ):
+                if thumb_url:
 
                     try:
 
-                        os.remove(
-                            temp
+                        print(
+                            f"[{index}/{total_items}] "
+                            f"Downloading Thumbnail...",
+                            flush=True
+                        )
+
+                        download_file_in_chunks(
+                            thumb_url,
+                            TEMP_WEBP
+                        )
+
+                        with Image.open(
+                            TEMP_WEBP
+                        ) as img:
+
+                            rgb_img = img.convert(
+                                "RGB"
+                            )
+
+                            rgb_img.save(
+                                TEMP_JPG,
+                                "JPEG"
+                            )
+
+                        thumb_path = TEMP_JPG
+
+                        print(
+                            f"[{index}/{total_items}] "
+                            f"Thumbnail ready.",
+                            flush=True
                         )
 
                     except Exception as e:
 
                         print(
-                            f"Could not remove "
-                            f"{temp}: {e}",
+                            f"Failed to process "
+                            f"image thumbnail: {e}",
                             flush=True
                         )
+
+                # ==========================================
+                # UPLOAD TO TELEGRAM
+                # ==========================================
+
+                print(
+                    f"[{index}/{total_items}] "
+                    f"Uploading to Telegram...",
+                    flush=True
+                )
+
+                # Reset upload progress for this file.
+                telegram_upload_progress._last_percent = -1
+
+                await client.send_file(
+
+                    CHANNEL_ID,
+
+                    file=TEMP_FILE,
+
+                    thumb=thumb_path,
+
+                    caption=caption,
+
+                    parse_mode="md",
+
+                    supports_streaming=True,
+
+                    attributes=[
+
+                        DocumentAttributeVideo(
+
+                            duration=duration,
+
+                            w=width,
+
+                            h=height,
+
+                            supports_streaming=True
+
+                        )
+
+                    ],
+
+                    # ==========================================
+                    # NEW: TELEGRAM UPLOAD PROGRESS
+                    # ==========================================
+
+                    progress_callback=telegram_upload_progress
+                )
+
+                # ==========================================
+                # MARK COMPLETED
+                # ==========================================
+
+                save_completed(
+                    title
+                )
+
+                # Upload succeeded: permanently mark this index processed.
+                save_progress_index(index)
+
+                print(
+                    f"[{index}/{total_items}] "
+                    f"Uploaded successfully!",
+                    flush=True
+                )
+
+                print(
+                    f"[COMPLETED] {title}",
+                    flush=True
+                )
+
+                break
+
+            # ==========================================
+            # TELEGRAM FLOOD WAIT
+            # ==========================================
+
+            except FloodWaitError as e:
+
+                print(
+                    f"Rate limited by Telegram. "
+                    f"Waiting {e.seconds} seconds...",
+                    flush=True
+                )
+
+                # Wait, then retry the SAME item (not skipped).
+                await asyncio.sleep(
+                    e.seconds + 5
+                )
+
+                continue
+
+            # ==========================================
+            # OTHER ERRORS / SKIPPED ITEMS
+            # ==========================================
+
+            except Exception as e:
+
+                attempt += 1
+
+                print(
+                    f"Error processing item "
+                    f"{index} ({title}) "
+                    f"[attempt {attempt}/{MAX_RETRIES}]: {e}",
+                    flush=True
+                )
+
+                if attempt < MAX_RETRIES:
+
+                    await asyncio.sleep(
+                        RETRY_DELAY
+                    )
+
+                    continue
+
+                save_failed(
+                    index,
+                    title,
+                    file_url,
+                    str(e)
+                )
+
+                if SKIP_FAILED:
+
+                    save_progress_index(index)
+
+                    print(
+                        f"[FAILED] Item {index} skipped "
+                        f"(SKIP_FAILED=1).",
+                        flush=True
+                    )
+
+                    break
+
+                print(
+                    f"[STOPPED] Item {index} failed {MAX_RETRIES} "
+                    f"times. Checkpoint stays before it; next start "
+                    f"resumes from item {index}.",
+                    flush=True
+                )
+
+                raise SystemExit(1)
+
+            # ==========================================
+            # CLEAN TEMP FILES
+            # ==========================================
+
+            finally:
+
+                for temp in [
+                    TEMP_FILE,
+                    TEMP_WEBP,
+                    TEMP_JPG
+                ]:
+
+                    if os.path.exists(
+                        temp
+                    ):
+
+                        try:
+
+                            os.remove(
+                                temp
+                            )
+
+                        except Exception as e:
+
+                            print(
+                                f"Could not remove "
+                                f"{temp}: {e}",
+                                flush=True
+                            )
 
         # ==========================================
         # NO FIXED DELAY
@@ -1291,27 +1284,6 @@ if __name__ == "__main__":
         exit(1)
 
     # ==========================================
-    # CHECK SUPABASE CHECKPOINT CONFIG
-    # ==========================================
-
-    if not SUPABASE_URL or not SUPABASE_KEY:
-
-        print(
-            "CRITICAL ERROR: "
-            "SUPABASE_URL or SUPABASE_KEY "
-            "environment variable is missing!",
-            flush=True
-        )
-
-        print(
-            "The bot will NOT start because "
-            "the Render filesystem is not persistent.",
-            flush=True
-        )
-
-        exit(1)
-
-    # ==========================================
     # START FLASK
     # ==========================================
 
@@ -1327,4 +1299,3 @@ if __name__ == "__main__":
     asyncio.run(
         main()
     )
-    
